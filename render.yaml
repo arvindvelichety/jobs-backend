@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: jobs-api
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+    healthCheckPath: /health
