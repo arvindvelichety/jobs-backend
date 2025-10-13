@@ -1,4 +1,4 @@
-// server.js — safe, incremental boot
+// server.js — diagnostic-safe version
 
 import express from "express";
 import dotenv from "dotenv";
@@ -6,52 +6,61 @@ dotenv.config();
 
 import fetch from "node-fetch";
 import { parse } from "csv-parse/sync";
-
-// Postgres (works with "type": "module")
 import pkg from "pg";
 const { Pool } = pkg;
 
 const app = express();
 app.use(express.json());
 
-// --- tiny request logger (helps in Render logs)
+// log every request
 app.use((req, res, next) => {
   const t0 = Date.now();
   res.on("finish", () => {
-    const ms = Date.now() - t0;
-    console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} ${ms}ms`);
+    console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} ${Date.now()-t0}ms`);
   });
   next();
 });
 
-// --- DB: make it optional so the app still boots
+// DB optional
 let pool = null;
 if (process.env.DATABASE_URL) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }, // Neon/Render friendly
+    ssl: { rejectUnauthorized: false },
   });
 } else {
-  console.warn("DATABASE_URL not set — /api/health will skip DB check.");
+  console.warn("DATABASE_URL not set — DB checks will be skipped.");
 }
 
-// --- Global crash guards (so the process doesn’t die silently)
-process.on("unhandledRejection", (e) => {
-  console.error("UNHANDLED REJECTION:", e);
-});
-process.on("uncaughtException", (e) => {
-  console.error("UNCAUGHT EXCEPTION:", e);
+// crash guards
+process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
+
+// --- DIAGNOSTIC: list routes so we know what’s live
+const routes = [];
+const add = (method, path, handler) => {
+  routes.push({ method, path });
+  app[method](path, handler);
+};
+
+// root
+add("get", "/", (_req, res) => {
+  res.json({
+    ok: true,
+    message: "Jobs API is running",
+    routes,
+    node: process.version,
+    port: process.env.PORT || 3000,
+  });
 });
 
-// ------- ROUTES -------
-
-// Quick liveness probe (no DB)
-app.get("/healthz", (_req, res) => {
+// liveness (no DB)
+add("get", "/healthz", (_req, res) => {
   res.json({ ok: true, env: process.env.NODE_ENV || "production" });
 });
 
-// DB-aware health
-app.get("/api/health", async (_req, res) => {
+// DB health
+add("get", "/api/health", async (_req, res) => {
   try {
     if (!pool) return res.json({ ok: true, db: "skipped", ts: null });
     const { rows } = await pool.query("select now() as ts");
@@ -62,68 +71,43 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
-// CSV importer (parse-only for now; safe)
-app.post("/api/import", async (req, res) => {
+// importer (parse-only for now)
+add("post", "/api/import", async (req, res) => {
   try {
-    // simple token check
     const token = req.header("x-import-token");
     if (!process.env.IMPORT_TOKEN || token !== process.env.IMPORT_TOKEN) {
       return res.status(401).json({ ok: false, error: "invalid token" });
     }
-
     const csvUrl = req.query.url;
-    if (!csvUrl) {
-      return res.status(400).json({ ok: false, error: "missing url query param" });
-    }
+    if (!csvUrl) return res.status(400).json({ ok: false, error: "missing url" });
 
-    // Fetch CSV
     const r = await fetch(csvUrl, { redirect: "follow" });
-    if (!r.ok) {
-      throw new Error(`fetch failed: ${r.status} ${r.statusText}`);
-    }
+    if (!r.ok) throw new Error(`fetch failed: ${r.status} ${r.statusText}`);
     const text = await r.text();
 
-    // Parse CSV
-    const records = parse(text, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true,
-    });
+    const records = parse(text, { columns: true, skip_empty_lines: true, trim: true });
+    const preview = records.slice(0, Math.min(3, records.length));
 
-    // Optional preview & limit for safety
-    const limit = Math.max(0, Math.min(Number(req.query.limit ?? 0), records.length));
-    const previewCount = limit || Math.min(records.length, 3);
-    const preview = records.slice(0, previewCount);
-
-    // NOTE: We’re NOT inserting yet (to avoid schema mismatches causing 5xx).
-    // Once we confirm this returns ok, we’ll enable inserts.
-
-    return res.json({
-      ok: true,
-      url: csvUrl,
-      parsed: records.length,
-      previewCount,
-      preview, // first few rows so you can confirm the field names
-      insert: "skipped (safe mode)",
-    });
+    res.json({ ok: true, parsed: records.length, previewCount: preview.length, preview, insert: "skipped" });
   } catch (err) {
     console.error("import error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// --- Start server
+// helpful 404 that shows available routes
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "not found", path: req.originalUrl, routes });
+});
+
+// start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Jobs API listening on ${PORT}`);
 });
 
-// --- Graceful shutdown (Render sends SIGTERM on redeploys)
+// graceful shutdown
 process.on("SIGTERM", async () => {
-  console.log("SIGTERM received, closing server...");
-  try {
-    if (pool) await pool.end();
-  } finally {
-    process.exit(0);
-  }
+  console.log("SIGTERM received");
+  try { if (pool) await pool.end(); } finally { process.exit(0); }
 });
