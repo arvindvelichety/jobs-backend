@@ -1,245 +1,310 @@
 // server.js
-// Minimal jobs backend with CSV import → Neon (Postgres)
-// Works on Render + local dev
+import "dotenv/config";
+import express from "express";
+import fetch from "node-fetch";
+import { Pool } from "pg";
+import { parse as csvParse } from "csv-parse";
+import readline from "node:readline";
 
-import express from 'express';
-import fetch from 'node-fetch';
-import { Pool } from 'pg';
-import { parse } from 'csv-parse';
-
-// Load .env locally (Render will already have env vars)
-try { (await import('dotenv')).config(); } catch (_) {}
-
+// ---------- config ----------
 const app = express();
+app.disable("x-powered-by");
 
-// --- Env & DB ---------------------------------------------------------------
-
-const PORT = process.env.PORT || 10000;
-
-// Required: DATABASE_URL (from Neon) and IMPORT_TOKEN (your secret)
-const DATABASE_URL = process.env.DATABASE_URL;
-const IMPORT_TOKEN  = process.env.IMPORT_TOKEN;
-
-if (!DATABASE_URL) {
-  console.error('ERROR: DATABASE_URL is not set');
-}
-if (!IMPORT_TOKEN) {
-  console.warn('WARNING: IMPORT_TOKEN is not set — /api/import will always 401');
-}
+const PORT = process.env.PORT || 3000;
+const IMPORT_TOKEN = (process.env.IMPORT_TOKEN || "").trim();
 
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Render + Neon
+  connectionString: process.env.DATABASE_URL,
+  // Render + Neon typically require ssl in prod
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
 });
 
-// Simple DB check helper
-async function dbOk() {
-  try {
-    const r = await pool.query('select 1 as ok');
-    return r.rows[0]?.ok === 1;
-  } catch (e) {
-    console.error('DB health error:', e.message);
+// ---------- small utils ----------
+const ok = (res, data = {}) => res.json({ ok: true, ...data });
+const err = (res, status, message, extra = {}) =>
+  res.status(status).json({ ok: false, error: message, ...extra });
+
+/** basic auth guard using x-import-token */
+const checkToken = (req, res) => {
+  const t = (req.headers["x-import-token"] || "").trim();
+  if (!IMPORT_TOKEN || !t || t !== IMPORT_TOKEN) {
+    err(res, 401, "unauthorized");
     return false;
   }
+  return true;
+};
+
+// ---------- DB schema discovery (one-time cached) ----------
+let JOBS_SCHEMA = null;
+/**
+ * Loads public.jobs columns/types so we only write fields that really exist.
+ * Result shape: { columns: Set<string>, types: Map<string, string> }
+ */
+async function loadJobsSchema() {
+  if (JOBS_SCHEMA) return JOBS_SCHEMA;
+  const sql = `
+    select column_name, data_type, udt_name
+    from information_schema.columns
+    where table_schema='public' and table_name='jobs'
+  `;
+  const { rows } = await pool.query(sql);
+  const columns = new Set(rows.map(r => r.column_name));
+  const types = new Map(rows.map(r => [r.column_name, (r.udt_name || r.data_type || "").toLowerCase()]));
+  JOBS_SCHEMA = { columns, types };
+  return JOBS_SCHEMA;
 }
 
-// --- CSV helpers ------------------------------------------------------------
+// ---------- value normalization ----------
+/**
+ * Convert an incoming value to something Postgres accepts based on column type.
+ * We’re conservative: strings remain strings; numeric -> Number; json/jsonb -> JSON; others pass-through.
+ */
+function coerceForColumn(col, val, types) {
+  if (val === undefined || val === null || val === "") return null;
+  const t = (types.get(col) || "").toLowerCase();
 
-const csvOptions = {
-  columns: true,        // header row -> keys
-  bom: true,            // handle UTF-8 BOM
-  trim: true,           // trim whitespace
-  skip_empty_lines: true,
-};
-
-const get = (row, key) => {
-  const v = (row?.[key] ?? '').toString().trim();
-  return v === '' ? null : v;
-};
-
-// Map one CSV row to DB columns (names must match your table)
-const mapRow = (row) => ({
-  company_slug: get(row, 'company_slug'),
-  company_name: get(row, 'company_name'),
-  job_id: get(row, 'job_id'),
-  internal_job_id: get(row, 'internal_job_id') ?? get(row, 'job_id'),
-  title: get(row, 'title'),
-  url: get(row, 'url'),
-  location_text: get(row, 'location_text'),
-  departments: get(row, 'departments'),
-  offices: get(row, 'offices'),
-  employment_type: get(row, 'employment_type'),
-  workplace_type: get(row, 'workplace_type'),
-  remote_hint: get(row, 'remote_hint'),
-  shift: get(row, 'shift'),
-  updated_at: get(row, 'updated_at'),
-  requisition_open_date: get(row, 'requisition_open_date'),
-  job_category: get(row, 'job_category'),
-  benefits: get(row, 'benefits'),
-  travel_requirement: get(row, 'travel_requirement'),
-  years_experience: get(row, 'years_experience'),
-  experience_range: get(row, 'experience_range'),
-  contractor_type: get(row, 'contractor_type'),
-  address: get(row, 'address'),
-  city: get(row, 'city'),
-  state: get(row, 'state'),
-  country: get(row, 'country'),
-  latitude: get(row, 'latitude'),
-  longitude: get(row, 'longitude'),
-  salary_currency: get(row, 'salary_currency'),
-  salary_min: get(row, 'salary_min'),
-  salary_max: get(row, 'salary_max'),
-  content_text: get(row, 'content_text'),
-  content_html: get(row, 'content_html'),
-});
-
-// Column order we’ll insert in
-const COLS = [
-  'company_slug','company_name','job_id','internal_job_id','title','url',
-  'location_text','departments','offices','employment_type','workplace_type',
-  'remote_hint','shift','updated_at','requisition_open_date','job_category',
-  'benefits','travel_requirement','years_experience','experience_range',
-  'contractor_type','address','city','state','country','latitude','longitude',
-  'salary_currency','salary_min','salary_max','content_text','content_html'
-];
-
-// Build a parameter list like $1,$2,...,$32
-const PLACEHOLDERS = COLS.map((_, i) => `$${i + 1}`).join(',');
-
-// Prepared insert that ignores duplicates (whatever unique you’ve set)
-const INSERT_SQL = `
-INSERT INTO jobs (${COLS.join(',')})
-VALUES (${PLACEHOLDERS})
-ON CONFLICT DO NOTHING
-`;
-
-// --- Routes -----------------------------------------------------------------
-
-// Root (simple JSON so Render doesn’t 502)
-app.get('/', (req, res) => {
-  res.json({ ok: true, service: 'jobs-backend', env: process.env.NODE_ENV || 'development' });
-});
-
-// Old health path Render likes
-app.get('/healthz', async (req, res) => {
-  res.type('text').send('ok');
-});
-
-// API health (checks DB)
-app.get('/api/health', async (req, res) => {
-  res.json({ ok: true, db: (await dbOk()) ? 'ok' : 'down', ts: new Date().toISOString() });
-});
-
-// Count jobs
-app.get('/api/jobs/count', async (req, res) => {
-  try {
-    const r = await pool.query('select count(*)::int as count from jobs');
-    res.json({ ok: true, count: r.rows[0].count });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Import CSV → jobs
-// Usage:
-// curl -X POST "https://.../api/import?url=ENCODED_CSV_URL&dryRun=false" -H "x-import-token: YOURTOKEN"
-app.post('/api/import', async (req, res) => {
-  try {
-    // Token check
-    const incoming = req.header('x-import-token') || '';
-    if (!IMPORT_TOKEN || incoming !== IMPORT_TOKEN) {
-      return res.status(401).json({ ok: false, error: 'unauthorized (bad x-import-token)' });
-    }
-
-    const csvUrl = req.query.url?.toString();
-    if (!csvUrl) {
-      return res.status(400).json({ ok: false, error: 'missing ?url=' });
-    }
-
-    const dryRun = (req.query.dryRun ?? 'true').toString().toLowerCase() !== 'false';
-
-    // Fetch CSV
-    const resp = await fetch(csvUrl);
-    if (!resp.ok) {
-      return res.status(400).json({ ok: false, error: `fetch failed: ${resp.status} ${resp.statusText}` });
-    }
-    const body = await resp.text();
-
-    // Parse CSV to objects
-    const rows = await new Promise((resolve, reject) => {
-      const out = [];
-      parse(body, csvOptions)
-        .on('readable', function () {
-          let rec;
-          while ((rec = this.read()) !== null) out.push(rec);
-        })
-        .on('error', reject)
-        .on('end', () => resolve(out));
-    });
-
-    if (rows.length === 0) {
-      return res.json({ ok: true, parsed: 0, previewCount: 0, preview: [], insert: dryRun ? 'skipped' : 'none' });
-    }
-
-    const mapped = rows.map(mapRow);
-
-    // Basic validations for NOT NULL columns you mentioned
-    const requiredFields = ['company_slug', 'internal_job_id'];
-    const missing = [];
-    mapped.forEach((m, idx) => {
-      requiredFields.forEach((f) => {
-        if (m[f] == null) missing.push({ row: idx + 1, field: f });
-      });
-    });
-    if (missing.length) {
-      return res.status(400).json({ ok: false, error: 'required fields missing', details: missing.slice(0, 10) });
-    }
-
-    // Dry run?
-    if (dryRun) {
-      return res.json({
-        ok: true,
-        parsed: mapped.length,
-        previewCount: Math.min(mapped.length, 3),
-        preview: mapped.slice(0, 3),
-        insert: 'skipped',
-      });
-    }
-
-    // Insert in a transaction
-    const client = await pool.connect();
-    let inserted = 0;
+  // json/jsonb columns
+  if (t === "json" || t === "jsonb") {
+    if (typeof val === "object") return val; // already array/object
+    const s = String(val).trim();
+    if (!s) return null;
     try {
-      await client.query('BEGIN');
-      for (const m of mapped) {
-        const values = COLS.map((c) => m[c] ?? null);
-        await client.query(INSERT_SQL, values);
-        inserted += 1; // counts attempted inserts; conflicts are ignored by DO NOTHING
-      }
-      await client.query('COMMIT');
+      // if it's already JSON text
+      if (s.startsWith("{") || s.startsWith("["))
+        return JSON.parse(s);
+      // treat pipe-delimited as array (common in your CSV)
+      if (s.includes("|"))
+        return s.split("|").map(x => x.trim()).filter(Boolean);
+      // plain string -> store as JSON string
+      return s;
+    } catch {
+      // fallback to string if parsing failed
+      return String(val);
+    }
+  }
+
+  // numeric-ish
+  if (["int4","int8","float4","float8","numeric","decimal"].some(k => t.includes(k))) {
+    const n = Number(val);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // boolean
+  if (t === "bool") {
+    const s = String(val).toLowerCase();
+    if (["true","t","1","yes","y"].includes(s)) return true;
+    if (["false","f","0","no","n"].includes(s)) return false;
+    return null;
+  }
+
+  // timestamps/dates: let Postgres cast strings
+  return String(val);
+}
+
+/**
+ * Build a parameterized INSERT for one row.
+ * Uses "ON CONFLICT DO NOTHING" so we don’t need to know the constraint/index name.
+ */
+function buildInsert(table, row, columns, types) {
+  const cols = [];
+  const params = [];
+  const values = [];
+
+  for (const col of columns) {
+    if (!(col in row)) continue;
+    cols.push(col);
+    params.push(`$${params.length + 1}`);
+    values.push(coerceForColumn(col, row[col], types));
+  }
+
+  if (cols.length === 0) return null;
+
+  const sql = `
+    insert into ${table} (${cols.map(c => `"${c}"`).join(", ")})
+    values (${params.join(", ")})
+    on conflict do nothing
+  `;
+  return { sql, values };
+}
+
+/**
+ * Upsert many rows (row-by-row inside one transaction; simple and robust).
+ * Returns { ok: number, errors: Array<{row:number,error:string}> }
+ */
+async function upsertMany(rows, client) {
+  const { columns, types } = await loadJobsSchema();
+
+  // Only insert columns that exist in the table, intersected with the incoming keys for each row
+  let okCount = 0;
+  const errors = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] || {};
+    // keep all keys but filter against actual columns
+    const cols = Object.keys(r).filter(k => columns.has(k));
+
+    const stmt = buildInsert("public.jobs", r, cols, types);
+    if (!stmt) continue;
+
+    try {
+      await client.query(stmt.sql, stmt.values);
+      okCount++;
     } catch (e) {
-      await client.query('ROLLBACK');
-      throw e;
+      errors.push({ row: i + 1, error: e.message });
+    }
+  }
+
+  return { ok: okCount, errors };
+}
+
+// ---------- CSV importer (existing /api/import) ----------
+app.post("/api/import", async (req, res) => {
+  try {
+    if (!checkToken(req, res)) return;
+
+    const url = String(req.query.url || "").trim();
+    if (!url) return err(res, 400, "missing url");
+
+    const dryRun = String(req.query.dryRun || "true").toLowerCase() !== "false";
+
+    // fetch remote file
+    const r = await fetch(url, { redirect: "follow" });
+    if (!r.ok) return err(res, 400, `failed to fetch: ${r.status} ${r.statusText}`);
+
+    // stream parse CSV -> objects
+    const parser = r.body.pipe(
+      csvParse({
+        columns: true,
+        bom: true,
+        trim: true,
+        skip_empty_lines: true,
+        relax_quotes: true,
+        relax_column_count: true,
+      })
+    );
+
+    const rows = [];
+    for await (const rec of parser) {
+      // normalize: empty strings -> null
+      for (const k of Object.keys(rec)) {
+        if (rec[k] === "") rec[k] = null;
+        if (typeof rec[k] === "string") rec[k] = rec[k].trim();
+      }
+      rows.push(rec);
+    }
+
+    if (dryRun) {
+      return ok(res, {
+        parsed: rows.length,
+        previewCount: Math.min(2, rows.length),
+        preview: rows.slice(0, 2),
+        insert: "skipped",
+      });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+      const { ok: inserted, errors } = await upsertMany(rows, client);
+      await client.query("commit");
+      return ok(res, { parsed: rows.length, inserted, errors });
+    } catch (e) {
+      await client.query("rollback");
+      return err(res, 500, e.message);
     } finally {
       client.release();
     }
-
-    // Return count + a tiny preview
-    res.json({
-      ok: true,
-      parsed: mapped.length,
-      inserted,
-      previewCount: Math.min(mapped.length, 2),
-      preview: mapped.slice(0, 2),
-    });
   } catch (e) {
-    console.error('IMPORT ERROR:', e);
-    res.status(500).json({ ok: false, error: e.message });
+    return err(res, 500, e.message);
   }
 });
 
-// --- Start ------------------------------------------------------------------
+// ---------- NDJSON importer (recommended) ----------
+app.post("/api/jobs/ndjson", async (req, res) => {
+  try {
+    if (!checkToken(req, res)) return;
 
+    const BATCH = Math.max(1, Math.min(5000, Number(req.query.batch || 1000)));
+    const dryRun = String(req.query.dryRun || "false").toLowerCase() === "true";
+    const rl = readline.createInterface({ input: req });
+
+    let batch = [];
+    let total = 0;
+    const errors = [];
+
+    const client = await pool.connect();
+    const flush = async () => {
+      if (!batch.length || dryRun) {
+        total += batch.length;
+        batch = [];
+        return;
+      }
+      const { ok: inserted, errors: errs } = await upsertMany(batch, client);
+      total += inserted;
+      if (errs?.length) errors.push(...errs);
+      batch = [];
+    };
+
+    try {
+      await client.query("begin");
+
+      for await (const line of rl) {
+        const s = line.trim();
+        if (!s) continue;
+        let obj;
+        try {
+          obj = JSON.parse(s);
+        } catch (e) {
+          errors.push({ error: "bad JSON line", message: e.message, line: s.slice(0, 120) });
+          continue;
+        }
+        // light normalization
+        for (const k of Object.keys(obj)) {
+          if (obj[k] === "") obj[k] = null;
+          if (typeof obj[k] === "string") obj[k] = obj[k].trim();
+        }
+        batch.push(obj);
+        if (batch.length >= BATCH) await flush();
+      }
+
+      await flush();
+
+      if (!dryRun) await client.query("commit");
+      else await client.query("rollback"); // no writes in dryRun
+
+      return ok(res, { processed: total, errors, dryRun });
+    } catch (e) {
+      await client.query("rollback");
+      return err(res, 500, e.message);
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    return err(res, 500, e.message);
+  }
+});
+
+// ---------- health & small helpers ----------
+app.get("/", (_req, res) => res.type("text/plain").send("ok"));
+app.get("/healthz", (_req, res) => ok(res, { env: process.env.NODE_ENV || "dev" }));
+app.get("/api/health", async (_req, res) => {
+  try {
+    await pool.query("select 1");
+    ok(res, { db: "ok", ts: new Date().toISOString() });
+  } catch (e) {
+    err(res, 500, e.message);
+  }
+});
+app.get("/api/jobs/count", async (_req, res) => {
+  try {
+    const { rows } = await pool.query('select count(*)::int as count from public.jobs');
+    ok(res, { count: rows[0]?.count ?? 0 });
+  } catch (e) {
+    err(res, 500, e.message);
+  }
+});
+
+// ---------- start ----------
 app.listen(PORT, () => {
-  console.log(`jobs-backend listening on :${PORT}`);
+  console.log(`listening on :${PORT}`);
 });
