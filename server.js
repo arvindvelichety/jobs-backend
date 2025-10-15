@@ -1,338 +1,280 @@
-// server.js  — full, safe version
-// Node 18+, "type": "module" in package.json
-
-import express from "express";
-import dotenv from "dotenv";
-import fetch from "node-fetch";
-import { parse as csvParse } from "csv-parse";
-import { createInterface } from "readline";
-import pg from "pg";
+// server.js
+import express from 'express';
+import dotenv from 'dotenv';
+import pkg from 'pg';
 
 dotenv.config();
 
-const { Pool } = pg;
-const PORT = process.env.PORT || 10000;
-const DATABASE_URL = process.env.DATABASE_URL;
-const IMPORT_TOKEN = process.env.IMPORT_TOKEN || "";
-const INSERT_MODE = process.env.INSERT_MODE || "1"; // 1 = upsert, anything else = insert only
+const { Pool } = pkg;
 
-// --- DB pool (Render/Neon friendly SSL) ---
+// ---- DB -------------------------------------------------------
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL?.includes("sslmode=require")
-    ? true
-    : { rejectUnauthorized: false },
+  connectionString: process.env.DATABASE_URL,
+  // For Neon/Render you usually want SSL
+  ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false },
 });
-pool.on("error", (err) => console.error("PG pool error:", err));
 
-// --- ensure table on boot ---
-async function ensureTables() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS jobs (
-      id BIGSERIAL PRIMARY KEY,
-      company_slug TEXT NOT NULL,
-      internal_job_id TEXT NOT NULL,
-      title TEXT,
-      url TEXT,
-      updated_at TIMESTAMPTZ DEFAULT now(),
-      payload JSONB,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      updated_row_at TIMESTAMPTZ DEFAULT now(),
-      UNIQUE (company_slug, internal_job_id)
-    );
-  `);
-}
-ensureTables().catch((e) => {
-  console.error("ensureTables failed:", e);
+// quick connectivity check at boot
+pool.on('error', (err) => {
+  console.error('Unexpected PG error', err);
   process.exit(1);
 });
 
+// ---- APP ------------------------------------------------------
 const app = express();
 
-// health + root
-app.get("/", (_req, res) => {
-  res.type("text/plain").send("ok\n");
+// Accept JSON bodies and NDJSON streaming
+app.use(express.json({ limit: '10mb' }));
+
+// NOTE: for NDJSON we’ll manually parse lines; see route below.
+
+// ---- HEALTH ---------------------------------------------------
+app.get('/', (_req, res) => {
+  res.type('text/plain').send('ok');
 });
-app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, env: process.env.NODE_ENV || "development" });
+
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true, env: process.env.NODE_ENV || 'development' });
 });
-app.get("/api/health", async (_req, res) => {
+
+app.get('/api/health', async (_req, res) => {
   try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true, db: "ok", ts: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    await pool.query('select 1');
+    res.json({ ok: true, db: 'ok', ts: new Date().toISOString() });
+  } catch (err) {
+    console.error('/api/health error:', err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// jobs count
-app.get("/api/jobs/count", async (_req, res) => {
+// ---- JOBS: COUNT ----------------------------------------------
+app.get('/api/jobs/count', async (_req, res) => {
   try {
-    const r = await pool.query("SELECT COUNT(*)::int AS c FROM jobs");
-    res.json({ ok: true, count: r.rows[0]?.c ?? 0 });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    const { rows } = await pool.query('select count(*)::int as c from jobs');
+    res.json({ ok: true, count: rows[0].c });
+  } catch (err) {
+    console.error('GET /api/jobs/count error:', err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// simple token check for write endpoints
-function checkToken(req, res, next) {
-  const t = req.headers["x-import-token"];
-  if (!IMPORT_TOKEN) {
-    return res.status(500).json({ ok: false, error: "IMPORT_TOKEN not set" });
-  }
-  if (!t || t !== IMPORT_TOKEN) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  next();
-}
-
-// ---- CSV import over URL ----------------------------------------------------
-// Usage:
-// curl -X POST "https://<service>.onrender.com/api/import?url=ENCODED_URL&dryRun=true" \
-//   -H "x-import-token: YOUR_TOKEN"
-app.post("/api/import", checkToken, async (req, res) => {
-  const url = req.query.url;
-  const dryRun = String(req.query.dryRun ?? "true").toLowerCase() !== "false";
-  if (!url) return res.status(400).json({ ok: false, error: "missing ?url" });
-
-  let resp;
+// ---- JOBS: LIST -----------------------------------------------
+// GET /api/jobs?limit=20&offset=0
+app.get('/api/jobs', async (req, res) => {
   try {
-    resp = await fetch(url.toString(), { redirect: "follow" });
-  } catch (e) {
-    return res.status(400).json({ ok: false, error: `fetch failed: ${String(e)}` });
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '20', 10), 1), 100);
+    const offset = Math.max(parseInt(req.query.offset || '0', 10), 0);
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        company_slug, company_name, job_id, internal_job_id, title, url,
+        location_text, departments, offices, employment_type, workplace_type,
+        remote_hint, shift, updated_at, requisition_open_date, job_category,
+        benefits, travel_requirement, years_experience, experience_range,
+        contractor_type, address, city, state, country, latitude, longitude,
+        salary_currency, salary_min, salary_max, content_text, content_html
+      FROM jobs
+      ORDER BY COALESCE(updated_row_at, updated_at, created_at, NOW()) DESC
+      LIMIT $1 OFFSET $2
+      `,
+      [limit, offset]
+    );
+
+    res.json({ ok: true, limit, offset, rows: rows.length, jobs: rows });
+  } catch (err) {
+    console.error('GET /api/jobs error:', err);
+    res.status(500).json({ ok: false, error: err.message });
   }
-  if (!resp.ok) {
-    return res.status(400).json({ ok: false, error: `source returned ${resp.status}` });
+});
+
+// ---- JOBS: NDJSON BULK IMPORT --------------------------------
+// POST /api/jobs/ndjson?batch=1000
+// Header: x-import-token: <your token>
+// Body: application/x-ndjson (one JSON object per line)
+app.post('/api/jobs/ndjson', async (req, res) => {
+  // 1) Guard by token
+  const token = req.header('x-import-token') || '';
+  if (!process.env.IMPORT_TOKEN || token !== process.env.IMPORT_TOKEN) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
   }
 
-  const previews = [];
-  let parsed = 0;
-  const rows = [];
+  // 2) Ensure correct content type
+  const ct = (req.headers['content-type'] || '').toLowerCase();
+  if (!ct.includes('application/x-ndjson')) {
+    return res.status(415).json({ ok: false, error: 'content-type must be application/x-ndjson' });
+  }
 
-  const parser = csvParse({
-    columns: true,          // map to object by header
-    bom: true,
-    trim: true,
-    skip_empty_lines: true,
-    relax_column_count: true, // be tolerant of extra commas
-  });
+  // 3) Stream in the NDJSON and split to lines robustly
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', async () => {
+    const text = Buffer.concat(chunks).toString('utf8');
+    // Split on CRLF/CR/LF safely
+    const lines = text.split(/\r\n|\n|\r/).filter(Boolean);
 
-  // helper to normalize fields from CSV
-  const get = (row, key) => {
-    const v = (row[key] ?? "").toString().trim();
-    return v === "" ? null : v;
-  };
+    // 4) Prepare batch insert
+    const batchSize = Math.max(1, Math.min(parseInt(req.query.batch || '1000', 10), 5000));
 
-  async function insertBatch(batch) {
-    if (!batch.length || dryRun) return;
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      for (const r of batch) {
-        const company_slug = (r.company_slug || "").trim();
-        const internal_job_id = (r.internal_job_id || "").trim();
-        if (!company_slug || !internal_job_id) {
-          throw new Error("required company_slug/internal_job_id missing");
+    // Mapping helper: ensure types
+    const toNullIfEmpty = (v) => (v === undefined || v === null ? null : v);
+    const toNumberOrNull = (v) => (v === undefined || v === null || v === '' ? null : Number(v));
+
+    // Columns we expect (must match your DB schema)
+    const COLS = [
+      'company_slug', 'company_name', 'job_id', 'internal_job_id', 'title', 'url',
+      'location_text', 'departments', 'offices', 'employment_type', 'workplace_type',
+      'remote_hint', 'shift', 'updated_at', 'requisition_open_date', 'job_category',
+      'benefits', 'travel_requirement', 'years_experience', 'experience_range',
+      'contractor_type', 'address', 'city', 'state', 'country', 'latitude', 'longitude',
+      'salary_currency', 'salary_min', 'salary_max', 'content_text', 'content_html'
+    ];
+
+    let read = 0;
+    let inserted = 0;
+    const errors = [];
+
+    // build parameterized INSERT once per batch
+    const insertBatch = async (batch) => {
+      if (batch.length === 0) return;
+
+      // Build values and placeholders
+      const values = [];
+      const placeholders = [];
+
+      batch.forEach((row, i) => {
+        // sanitize/coerce
+        const obj = {
+          company_slug: row.company_slug,
+          company_name: toNullIfEmpty(row.company_name),
+          job_id: toNullIfEmpty(row.job_id),
+          internal_job_id: row.internal_job_id,
+          title: toNullIfEmpty(row.title),
+          url: toNullIfEmpty(row.url),
+          location_text: toNullIfEmpty(row.location_text),
+          departments: row.departments ?? null, // expect JSON/array in NDJSON
+          offices: row.offices ?? null,         // expect JSON/array in NDJSON
+          employment_type: toNullIfEmpty(row.employment_type),
+          workplace_type: toNullIfEmpty(row.workplace_type),
+          remote_hint: toNullIfEmpty(row.remote_hint),
+          shift: toNullIfEmpty(row.shift),
+          updated_at: toNullIfEmpty(row.updated_at),
+          requisition_open_date: toNullIfEmpty(row.requisition_open_date),
+          job_category: toNullIfEmpty(row.job_category),
+          benefits: row.benefits ?? null,       // expect JSON/array in NDJSON
+          travel_requirement: toNullIfEmpty(row.travel_requirement),
+          years_experience: toNumberOrNull(row.years_experience),
+          experience_range: toNullIfEmpty(row.experience_range),
+          contractor_type: toNullIfEmpty(row.contractor_type),
+          address: toNullIfEmpty(row.address),
+          city: toNullIfEmpty(row.city),
+          state: toNullIfEmpty(row.state),
+          country: toNullIfEmpty(row.country),
+          latitude: toNumberOrNull(row.latitude),
+          longitude: toNumberOrNull(row.longitude),
+          salary_currency: toNullIfEmpty(row.salary_currency),
+          salary_min: toNumberOrNull(row.salary_min),
+          salary_max: toNumberOrNull(row.salary_max),
+          content_text: toNullIfEmpty(row.content_text),
+          content_html: toNullIfEmpty(row.content_html),
+        };
+
+        // basic required fields
+        if (!obj.company_slug || !obj.internal_job_id) {
+          errors.push({ row: { company_slug: obj.company_slug, internal_job_id: obj.internal_job_id }, error: 'company_slug and internal_job_id are required' });
+          return;
         }
-        const title = r.title ?? null;
-        const url = r.url ?? null;
-        const updated_at = r.updated_at ? new Date(r.updated_at) : null;
-        const payload = JSON.stringify(r);
 
-        const upsert = `
-          INSERT INTO jobs (company_slug, internal_job_id, title, url, updated_at, payload)
-          VALUES ($1,$2,$3,$4,COALESCE($5, now()), $6::jsonb)
-          ON CONFLICT (company_slug, internal_job_id)
-          ${INSERT_MODE === "1"
-            ? `DO UPDATE SET title=EXCLUDED.title, url=EXCLUDED.url,
-                             updated_at=COALESCE(EXCLUDED.updated_at, jobs.updated_at),
-                             payload=COALESCE(EXCLUDED.payload, jobs.payload),
-                             updated_row_at=now()`
-            : "DO NOTHING"};
-        `;
-        await client.query(upsert, [company_slug, internal_job_id, title, url, updated_at, payload]);
+        // push values in COLS order
+        COLS.forEach((k) => values.push(obj[k]));
+
+        const base = i * COLS.length;
+        const ph = COLS.map((_, j) => `$${base + j + 1}`);
+        placeholders.push(`(${ph.join(',')})`);
+      });
+
+      if (placeholders.length === 0) return;
+
+      // INSERT … ON CONFLICT (company_slug, internal_job_id) DO UPDATE …
+      const sql = `
+        INSERT INTO jobs (${COLS.join(',')})
+        VALUES ${placeholders.join(',')}
+        ON CONFLICT (company_slug, internal_job_id)
+        DO UPDATE SET
+          company_name = EXCLUDED.company_name,
+          job_id = EXCLUDED.job_id,
+          title = EXCLUDED.title,
+          url = EXCLUDED.url,
+          location_text = EXCLUDED.location_text,
+          departments = EXCLUDED.departments,
+          offices = EXCLUDED.offices,
+          employment_type = EXCLUDED.employment_type,
+          workplace_type = EXCLUDED.workplace_type,
+          remote_hint = EXCLUDED.remote_hint,
+          shift = EXCLUDED.shift,
+          updated_at = EXCLUDED.updated_at,
+          requisition_open_date = EXCLUDED.requisition_open_date,
+          job_category = EXCLUDED.job_category,
+          benefits = EXCLUDED.benefits,
+          travel_requirement = EXCLUDED.travel_requirement,
+          years_experience = EXCLUDED.years_experience,
+          experience_range = EXCLUDED.experience_range,
+          contractor_type = EXCLUDED.contractor_type,
+          address = EXCLUDED.address,
+          city = EXCLUDED.city,
+          state = EXCLUDED.state,
+          country = EXCLUDED.country,
+          latitude = EXCLUDED.latitude,
+          longitude = EXCLUDED.longitude,
+          salary_currency = EXCLUDED.salary_currency,
+          salary_min = EXCLUDED.salary_min,
+          salary_max = EXCLUDED.salary_max,
+          content_text = EXCLUDED.content_text,
+          content_html = EXCLUDED.content_html,
+          updated_row_at = NOW()
+        RETURNING 1;
+      `;
+
+      try {
+        const result = await pool.query(sql, values);
+        inserted += result.rowCount;
+      } catch (err) {
+        console.error('NDJSON batch insert error:', err);
+        errors.push({ batchError: err.message });
       }
-      await client.query("COMMIT");
-    } catch (e) {
-      try { await client.query("ROLLBACK"); } catch {}
-      throw e;
-    } finally {
-      client.release();
-    }
-  }
+    };
 
-  try {
-    let batch = [];
-    const BATCH = 1000;
+    // chunk + insert
+    const current = [];
+    for (const line of lines) {
+      read++;
+      if (!line.trim()) continue;
 
-    await new Promise((resolve, reject) => {
-      resp.body.pipe(parser)
-        .on("readable", () => {
-          let row;
-          while ((row = parser.read()) !== null) {
-            parsed++;
-
-            // map CSV into normalized record, honoring header names
-            const rec = {
-              company_slug: get(row, "company_slug"),
-              company_name: get(row, "company_name"),
-              job_id: get(row, "job_id"),
-              internal_job_id: get(row, "internal_job_id"),
-              title: get(row, "title"),
-              url: get(row, "url"),
-              location_text: get(row, "location_text"),
-              departments: get(row, "departments"),
-              offices: get(row, "offices"),
-              employment_type: get(row, "employment_type"),
-              workplace_type: get(row, "workplace_type"),
-              remote_hint: get(row, "remote_hint"),
-              shift: get(row, "shift"),
-              updated_at: get(row, "updated_at"),
-              requisition_open_date: get(row, "requisition_open_date"),
-              job_category: get(row, "job_category"),
-              benefits: get(row, "benefits"),
-              travel_requirement: get(row, "travel_requirement"),
-              years_experience: get(row, "years_experience"),
-              experience_range: get(row, "experience_range"),
-              contractor_type: get(row, "contractor_type"),
-              address: get(row, "address"),
-              city: get(row, "city"),
-              state: get(row, "state"),
-              country: get(row, "country"),
-              latitude: get(row, "latitude"),
-              longitude: get(row, "longitude"),
-              salary_currency: get(row, "salary_currency"),
-              salary_min: get(row, "salary_min"),
-              salary_max: get(row, "salary_max"),
-              content_text: get(row, "content_text"),
-              content_html: get(row, "content_html"),
-            };
-
-            if (previews.length < 2) previews.push(rec);
-
-            // validate required keys (match our DB unique key)
-            if (!rec.company_slug || !rec.internal_job_id) {
-              // skip invalid rows but keep a preview
-            } else {
-              batch.push(rec);
-              if (batch.length >= BATCH) {
-                parser.pause();
-                insertBatch(batch)
-                  .then(() => { batch = []; parser.resume(); })
-                  .catch(reject);
-              }
-            }
-          }
-        })
-        .once("end", async () => {
-          try {
-            if (batch.length) await insertBatch(batch);
-            resolve();
-          } catch (e) {
-            reject(e);
-          }
-        })
-        .once("error", reject);
-    });
-
-    res.json({
-      ok: true,
-      parsed,
-      dryRun,
-      previewCount: previews.length,
-      preview: previews,
-      insert: dryRun ? "skipped" : "done",
-    });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-// ---- NDJSON streaming (fixed; no double-read) -------------------------------
-// Each line must be a valid JSON object with at least company_slug & internal_job_id.
-app.post("/api/jobs/ndjson", checkToken, async (req, res) => {
-  const batchSize = Math.max(1, Math.min(5000, Number(req.query.batch) || 1000));
-
-  let read = 0;
-  let inserted = 0;
-  const errors = [];
-
-  async function insertBatch(recs) {
-    if (!recs.length) return;
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      for (const r of recs) {
-        const company_slug = (r.company_slug || "").trim();
-        const internal_job_id = (r.internal_job_id || "").trim();
-        if (!company_slug || !internal_job_id) {
-          errors.push({ row: r, error: "missing company_slug/internal_job_id" });
-          continue;
-        }
-        const title = r.title ?? null;
-        const url = r.url ?? null;
-        const updated_at = r.updated_at ? new Date(r.updated_at) : null;
-        const payload = JSON.stringify(r);
-
-        try {
-          await client.query(
-            `INSERT INTO jobs (company_slug, internal_job_id, title, url, updated_at, payload)
-             VALUES ($1,$2,$3,$4,COALESCE($5, now()), $6::jsonb)
-             ON CONFLICT (company_slug, internal_job_id)
-             ${INSERT_MODE === "1"
-               ? `DO UPDATE SET title=EXCLUDED.title, url=EXCLUDED.url,
-                                updated_at=COALESCE(EXCLUDED.updated_at, jobs.updated_at),
-                                payload=COALESCE(EXCLUDED.payload, jobs.payload),
-                                updated_row_at=now()`
-               : "DO NOTHING"};`,
-            [company_slug, internal_job_id, title, url, updated_at, payload]
-          );
-          inserted++;
-        } catch (e) {
-          try { await client.query("ROLLBACK"); await client.query("BEGIN"); } catch {}
-          errors.push({ row: { company_slug, internal_job_id }, error: String(e?.message || e) });
-        }
+      try {
+        const obj = JSON.parse(line);
+        current.push(obj);
+      } catch (err) {
+        errors.push({ row: read, error: `invalid JSON: ${err.message}` });
+        continue;
       }
-      await client.query("COMMIT");
-    } catch (e) {
-      try { await client.query("ROLLBACK"); } catch {}
-      errors.push({ batch: "fatal", error: String(e?.message || e) });
-    } finally {
-      client.release();
-    }
-  }
 
-  const rl = createInterface({ input: req, crlfDelay: Infinity });
-  let buffer = [];
-
-  rl.on("line", (line) => {
-    if (!line.trim()) return;
-    read++;
-    try {
-      buffer.push(JSON.parse(line));
-      if (buffer.length >= batchSize) {
-        rl.pause();
-        insertBatch(buffer.splice(0, buffer.length))
-          .then(() => rl.resume())
-          .catch((e) => { errors.push({ batch: "fatal", error: String(e) }); rl.resume(); });
+      if (current.length >= batchSize) {
+        await insertBatch(current.splice(0, current.length));
       }
-    } catch (e) {
-      errors.push({ row: read, error: `invalid JSON: ${String(e.message || e)}` });
     }
+    // tail
+    await insertBatch(current);
+
+    res.json({ ok: true, read, inserted, errorsCount: errors.length, errors });
   });
 
-  rl.once("close", async () => {
-    if (buffer.length) await insertBatch(buffer.splice(0, buffer.length));
-    res.json({ ok: true, read, inserted, errorsCount: errors.length, errors: errors.slice(0, 50) });
-  });
-
-  req.once("error", (e) => {
-    errors.push({ stream: "request", error: String(e) });
+  req.on('error', (e) => {
+    console.error('NDJSON stream error:', e);
   });
 });
 
-// --- start server ---
+// ---- START ----------------------------------------------------
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`jobs-backend listening on :${PORT}`);
 });
