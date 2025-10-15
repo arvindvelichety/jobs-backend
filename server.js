@@ -1,229 +1,250 @@
 // server.js
 import express from 'express';
 import dotenv from 'dotenv';
-import pkg from 'pg';
+import { Pool } from 'pg';
 
+// ---------- env & config ----------
 dotenv.config();
-const { Pool } = pkg;
+const PORT = process.env.PORT || 10000;
 
+// Render | Neon PG
+// Expected envs: PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD (or DATABASE_URL)
+// Also: IMPORT_TOKEN for authenticated imports
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || undefined,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
+});
+
+// Basic app (no global body parser for NDJSON route)
 const app = express();
 
-// We’ll use body parsers for JSON routes, but the NDJSON route reads raw.
-app.use(express.json({ limit: '50mb' }));
+// Only enable JSON parser for normal JSON routes (not NDJSON)
+app.use(express.json({ limit: '10mb' }));
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // Render/Neon friendly defaults:
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-});
+// ---------- helpers ----------
+function ok(res, data = {}) {
+  return res.json({ ok: true, ...data });
+}
+function bad(res, msg, extra = {}) {
+  return res.status(400).json({ ok: false, error: msg, ...extra });
+}
+function authOr401(req, res) {
+  const importToken = req.get('x-import-token');
+  if (!process.env.IMPORT_TOKEN || importToken !== process.env.IMPORT_TOKEN) {
+    res.status(401).json({ ok: false, error: 'unauthorized' });
+    return false;
+  }
+  return true;
+}
 
-// simple health
-app.get(['/healthz', '/api/health'], async (req, res) => {
+// Small PG ping
+async function pingDb() {
+  const { rows } = await pool.query('SELECT NOW() AS ts');
+  return rows[0].ts;
+}
+
+// Upsert one job (minimal required fields + payload passthrough)
+async function upsertJob(client, row) {
+  // required keys
+  const company_slug = (row.company_slug ?? '').toString().trim();
+  const internal_job_id = (row.internal_job_id ?? '').toString().trim();
+  if (!company_slug || !internal_job_id) {
+    throw new Error('missing company_slug or internal_job_id');
+  }
+
+  // a few commonly-used top-level columns (optional)
+  const title = row.title ?? null;
+  const url = row.url ?? null;
+
+  // updated_at: allow ISO string or null; normalize to timestamp or null
+  // Postgres will cast text to timestamp when possible.
+  const updated_at = row.updated_at ?? null;
+
+  // Keep **all** original fields in payload for flexibility/search later
+  const payload = row;
+
+  // NOTE: We do NOT reference columns that might not exist in your table.
+  // If your schema has additional columns (e.g., updated_row_at), use triggers
+  // or add them explicitly.
+  await client.query(
+    `
+    INSERT INTO jobs (company_slug, internal_job_id, title, url, updated_at, payload)
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+    ON CONFLICT (company_slug, internal_job_id)
+    DO UPDATE SET
+      title      = EXCLUDED.title,
+      url        = EXCLUDED.url,
+      updated_at = EXCLUDED.updated_at,
+      payload    = EXCLUDED.payload
+    `,
+    [company_slug, internal_job_id, title, url, updated_at, JSON.stringify(payload)]
+  );
+}
+
+// ---------- routes ----------
+
+// Health
+app.get('/api/health', async (_req, res) => {
   try {
-    await pool.query('select 1');
-    res.json({ ok: true, db: 'ok', ts: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    const ts = await pingDb();
+    ok(res, { db: 'ok', ts });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// count
+// Count via view (preferred) or fallback to table if view is absent
 app.get('/api/jobs/count', async (_req, res) => {
   try {
-    const r = await pool.query('select count(*)::int as c from jobs');
-    res.json({ ok: true, count: r.rows[0].c });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    let q = 'SELECT COUNT(*)::int AS count FROM jobs_view';
+    try {
+      const { rows } = await pool.query(q);
+      ok(res, { count: rows[0].count });
+    } catch {
+      // fallback if the view doesn't exist
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM jobs');
+      ok(res, { count: rows[0].count });
+    }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// list (very simple)
+// List jobs (reads from jobs_view for nicer shape)
 app.get('/api/jobs', async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit ?? '20', 10), 100);
-  const offset = parseInt(req.query.offset ?? '0', 10);
-
   try {
-    const r = await pool.query(
-      `select
-         company_slug, internal_job_id, company_name, title, url,
-         location_text, employment_type, workplace_type, updated_at,
-         salary_currency, salary_min, salary_max,
-         latitude, longitude, content_text
-       from jobs
-       order by updated_at desc nulls last
-       limit $1 offset $2`,
-      [limit, offset]
-    );
+    const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit, 10) || 20));
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
 
-    res.json({ ok: true, limit, offset, rows: r.rowCount, jobs: r.rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    let q = `
+      SELECT *
+      FROM jobs_view
+      ORDER BY created_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+    try {
+      const { rows } = await pool.query(q, [limit, offset]);
+      ok(res, { limit, offset, rows: rows.length, jobs: rows });
+    } catch {
+      // fallback: show raw jobs if view not present
+      const { rows } = await pool.query(
+        `
+        SELECT *
+        FROM jobs
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2
+        `,
+        [limit, offset]
+      );
+      ok(res, { limit, offset, rows: rows.length, jobs: rows });
+    }
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// NDJSON bulk insert (POST /api/jobs/ndjson)
-// content-type: application/x-ndjson
+// Secure NDJSON bulk upsert
 app.post('/api/jobs/ndjson', async (req, res) => {
   try {
-    const importToken = req.get('x-import-token');
-    if (!process.env.IMPORT_TOKEN || importToken !== process.env.IMPORT_TOKEN) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
-    }
+    if (!authOr401(req, res)) return;
 
-    // Read raw NDJSON body
+    // Read raw body (don’t use express.json here)
     let body = '';
     await new Promise((resolve, reject) => {
       req.setEncoding('utf8');
-      req.on('data', chunk => (body += chunk));
+      req.on('data', (chunk) => (body += chunk));
       req.on('end', resolve);
       req.on('error', reject);
     });
 
-    const lines = body.split(/\r?\n/).filter(Boolean);
-    const jobs = [];
-    const parseErrors = [];
+    const lines = body
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      try {
-        const obj = JSON.parse(line);
-
-        // Map only the fields we keep in the core table
-        jobs.push({
-          company_slug: obj.company_slug ?? null,
-          internal_job_id: obj.internal_job_id ?? null,
-          company_name: obj.company_name ?? null,
-          title: obj.title ?? null,
-          url: obj.url ?? null,
-          location_text: obj.location_text ?? null,
-          employment_type: obj.employment_type ?? null,  // FULL_TIME / PART_TIME ...
-          workplace_type: obj.workplace_type ?? null,    // on_site / hybrid / remote
-          updated_at: obj.updated_at ?? null,
-          salary_currency: obj.salary_currency ?? null,
-          salary_min: obj.salary_min ?? null,
-          salary_max: obj.salary_max ?? null,
-          latitude: obj.latitude ?? null,
-          longitude: obj.longitude ?? null,
-          content_text: obj.content_text ?? null,
-          extras: buildExtras(obj), // stash anything else so it isn’t lost
-        });
-      } catch (e) {
-        parseErrors.push({ line: i + 1, error: 'invalid json' });
-      }
+    if (lines.length === 0) {
+      return bad(res, 'no NDJSON lines found');
     }
 
-    if (jobs.length === 0) {
-      return res.json({ ok: true, read: lines.length, inserted: 0, errorsCount: parseErrors.length, errors: parseErrors });
-    }
+    const batch = Math.max(1, Math.min(5000, parseInt(req.query.batch, 10) || 1000));
 
-    // insert in a single transaction
+    let read = 0;
+    let inserted = 0;
+    let errors = [];
+
+    // Process in a single transaction for atomicity
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      // ensure table exists (safe to run each import)
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS jobs (
-          company_slug    text NOT NULL,
-          internal_job_id text NOT NULL,
-          company_name    text,
-          title           text,
-          url             text,
-          location_text   text,
-          employment_type text,
-          workplace_type  text,
-          updated_at      timestamptz,
-          salary_currency text,
-          salary_min      numeric,
-          salary_max      numeric,
-          latitude        numeric,
-          longitude       numeric,
-          content_text    text,
-          extras          jsonb,
-          created_at      timestamptz DEFAULT now(),
-          PRIMARY KEY (company_slug, internal_job_id)
-        );
-      `);
-
-      // upsert rows
-      const sql = `
-        INSERT INTO jobs (
-          company_slug, internal_job_id, company_name, title, url,
-          location_text, employment_type, workplace_type, updated_at,
-          salary_currency, salary_min, salary_max,
-          latitude, longitude, content_text, extras
-        )
-        VALUES (
-          $1,$2,$3,$4,$5,
-          $6,$7,$8,$9,
-          $10,$11,$12,
-          $13,$14,$15,$16
-        )
-        ON CONFLICT (company_slug, internal_job_id) DO UPDATE SET
-          company_name    = EXCLUDED.company_name,
-          title           = EXCLUDED.title,
-          url             = EXCLUDED.url,
-          location_text   = EXCLUDED.location_text,
-          employment_type = EXCLUDED.employment_type,
-          workplace_type  = EXCLUDED.workplace_type,
-          updated_at      = EXCLUDED.updated_at,
-          salary_currency = EXCLUDED.salary_currency,
-          salary_min      = EXCLUDED.salary_min,
-          salary_max      = EXCLUDED.salary_max,
-          latitude        = EXCLUDED.latitude,
-          longitude       = EXCLUDED.longitude,
-          content_text    = EXCLUDED.content_text,
-          extras          = COALESCE(jobs.extras, '{}'::jsonb) || EXCLUDED.extras
-      `;
-
-      let inserted = 0;
-      for (const j of jobs) {
-        // require identity
-        if (!j.company_slug || !j.internal_job_id) { continue; }
-
-        await client.query(sql, [
-          j.company_slug, j.internal_job_id, j.company_name, j.title, j.url,
-          j.location_text, j.employment_type, j.workplace_type, j.updated_at,
-          j.salary_currency, j.salary_min, j.salary_max,
-          j.latitude, j.longitude, j.content_text, j.extras
-        ]);
-        inserted++;
+      for (let i = 0; i < lines.length; i += batch) {
+        const chunk = lines.slice(i, i + batch);
+        for (let j = 0; j < chunk.length; j++) {
+          const n = i + j + 1;
+          read++;
+          let obj;
+          try {
+            obj = JSON.parse(chunk[j]);
+          } catch (e) {
+            errors.push({ row: n, error: 'invalid JSON', detail: e.message });
+            continue;
+          }
+          try {
+            await upsertJob(client, obj);
+            inserted++;
+          } catch (e) {
+            // extract safe summary of the offending row
+            const rowSummary = {
+              company_slug: obj?.company_slug ?? null,
+              internal_job_id: obj?.internal_job_id ?? null,
+            };
+            errors.push({ row: n, rowSummary, error: e.message });
+          }
+        }
       }
 
-      await client.query('COMMIT');
+      if (errors.length > 0) {
+        // If you prefer partial success, you could COMMIT and return with errors.
+        // For now, commit regardless to keep successfully parsed rows.
+        await client.query('COMMIT');
+      } else {
+        await client.query('COMMIT');
+      }
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
       client.release();
-
-      return res.json({ ok: true, read: lines.length, inserted, errorsCount: parseErrors.length, errors: parseErrors });
-    } catch (e) {
-      try { await client.query('ROLLBACK'); } catch {}
-      client.release();
-      return res.status(500).json({ ok: false, error: e.message });
     }
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+
+    res.json({
+      ok: true,
+      read,
+      inserted,
+      errorsCount: errors.length,
+      ...(errors.length ? { errors } : {}),
+    });
+  } catch (err) {
+    console.error('POST /api/jobs/ndjson failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// tiny helpers
-function buildExtras(obj) {
-  const keep = new Set([
-    'company_slug','internal_job_id','company_name','title','url',
-    'location_text','employment_type','workplace_type','updated_at',
-    'salary_currency','salary_min','salary_max','latitude','longitude','content_text'
-  ]);
-  const extras = {};
-  for (const k of Object.keys(obj)) {
-    if (!keep.has(k)) extras[k] = obj[k];
+// Simple root page (helps Render health)
+app.get('/', (_req, res) => {
+  res.type('text/plain').send('ok');
+});
+
+// ---------- start ----------
+app.listen(PORT, () => {
+  console.log(`Server listening on :${PORT}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  try {
+    await pool.end();
+  } finally {
+    process.exit(0);
   }
-  return Object.keys(extras).length ? extras : null;
-}
-
-// root
-app.get('/', (_req, res) => res.json({ ok: true, service: 'jobs-backend' }));
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`jobs-backend listening on :${port}`);
 });
