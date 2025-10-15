@@ -1,157 +1,229 @@
 // server.js
-import express from "express";
-import pkg from "pg";
-import dotenv from "dotenv";
+import express from 'express';
+import dotenv from 'dotenv';
+import pkg from 'pg';
 
 dotenv.config();
 const { Pool } = pkg;
+
 const app = express();
 
-// database connection
+// We’ll use body parsers for JSON routes, but the NDJSON route reads raw.
+app.use(express.json({ limit: '50mb' }));
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  // Render/Neon friendly defaults:
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
-// simple health check
-app.get("/api/health", async (req, res) => {
+// simple health
+app.get(['/healthz', '/api/health'], async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT now() AS ts");
-    res.json({ ok: true, db: "ok", ts: rows[0].ts });
+    await pool.query('select 1');
+    res.json({ ok: true, db: 'ok', ts: new Date().toISOString() });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// count endpoint
-app.get("/api/jobs/count", async (req, res) => {
+// count
+app.get('/api/jobs/count', async (_req, res) => {
   try {
-    const { rows } = await pool.query("SELECT COUNT(*) AS count FROM jobs");
-    res.json({ ok: true, count: parseInt(rows[0].count, 10) });
+    const r = await pool.query('select count(*)::int as c from jobs');
+    res.json({ ok: true, count: r.rows[0].c });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// list jobs
-app.get("/api/jobs", async (req, res) => {
-  const limit = parseInt(req.query.limit || "20", 10);
-  const offset = parseInt(req.query.offset || "0", 10);
+// list (very simple)
+app.get('/api/jobs', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit ?? '20', 10), 100);
+  const offset = parseInt(req.query.offset ?? '0', 10);
+
   try {
-    const { rows } = await pool.query(
-      "SELECT * FROM jobs ORDER BY updated_at DESC LIMIT $1 OFFSET $2",
+    const r = await pool.query(
+      `select
+         company_slug, internal_job_id, company_name, title, url,
+         location_text, employment_type, workplace_type, updated_at,
+         salary_currency, salary_min, salary_max,
+         latitude, longitude, content_text
+       from jobs
+       order by updated_at desc nulls last
+       limit $1 offset $2`,
       [limit, offset]
     );
-    res.json({ ok: true, limit, offset, rows: rows.length, jobs: rows });
+
+    res.json({ ok: true, limit, offset, rows: r.rowCount, jobs: r.rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ✅ NDJSON bulk insert route (the one you pasted)
-app.post("/api/jobs/ndjson", async (req, res) => {
+// NDJSON bulk insert (POST /api/jobs/ndjson)
+// content-type: application/x-ndjson
+app.post('/api/jobs/ndjson', async (req, res) => {
   try {
-    const importToken = req.get("x-import-token");
+    const importToken = req.get('x-import-token');
     if (!process.env.IMPORT_TOKEN || importToken !== process.env.IMPORT_TOKEN) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    // read raw NDJSON body
-    let body = "";
+    // Read raw NDJSON body
+    let body = '';
     await new Promise((resolve, reject) => {
-      req.setEncoding("utf8");
-      req.on("data", chunk => (body += chunk));
-      req.on("end", resolve);
-      req.on("error", reject);
+      req.setEncoding('utf8');
+      req.on('data', chunk => (body += chunk));
+      req.on('end', resolve);
+      req.on('error', reject);
     });
 
     const lines = body.split(/\r?\n/).filter(Boolean);
-    const rows = [];
-    for (const line of lines) {
-      const o = JSON.parse(line);
-      const j = v => (v == null ? null : JSON.stringify(v));
-      const txt = v => (v == null ? null : String(v));
-      const num = v => (v == null ? null : Number(v));
-      const when = v => (v ? new Date(v) : null);
+    const jobs = [];
+    const parseErrors = [];
 
-      rows.push({
-        company_slug: txt(o.company_slug),
-        company_name: txt(o.company_name),
-        job_id: txt(o.job_id),
-        internal_job_id: txt(o.internal_job_id),
-        title: txt(o.title),
-        url: txt(o.url),
-        location_text: txt(o.location_text),
-        departments: j(o.departments),
-        offices: j(o.offices),
-        employment_type: txt(o.employment_type),
-        workplace_type: txt(o.workplace_type),
-        remote_hint: txt(o.remote_hint),
-        shift: txt(o.shift),
-        updated_at: when(o.updated_at),
-        requisition_open_date: when(o.requisition_open_date),
-        job_category: txt(o.job_category),
-        benefits: j(o.benefits),
-        travel_requirement: txt(o.travel_requirement),
-        years_experience: num(o.years_experience),
-        experience_range: txt(o.experience_range),
-        contractor_type: txt(o.contractor_type),
-        address: txt(o.address),
-        city: txt(o.city),
-        state: txt(o.state),
-        country: txt(o.country),
-        latitude: num(o.latitude),
-        longitude: num(o.longitude),
-        salary_currency: txt(o.salary_currency),
-        salary_min: num(o.salary_min),
-        salary_max: num(o.salary_max),
-        content_text: txt(o.content_text),
-        content_html: txt(o.content_html),
-      });
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      try {
+        const obj = JSON.parse(line);
+
+        // Map only the fields we keep in the core table
+        jobs.push({
+          company_slug: obj.company_slug ?? null,
+          internal_job_id: obj.internal_job_id ?? null,
+          company_name: obj.company_name ?? null,
+          title: obj.title ?? null,
+          url: obj.url ?? null,
+          location_text: obj.location_text ?? null,
+          employment_type: obj.employment_type ?? null,  // FULL_TIME / PART_TIME ...
+          workplace_type: obj.workplace_type ?? null,    // on_site / hybrid / remote
+          updated_at: obj.updated_at ?? null,
+          salary_currency: obj.salary_currency ?? null,
+          salary_min: obj.salary_min ?? null,
+          salary_max: obj.salary_max ?? null,
+          latitude: obj.latitude ?? null,
+          longitude: obj.longitude ?? null,
+          content_text: obj.content_text ?? null,
+          extras: buildExtras(obj), // stash anything else so it isn’t lost
+        });
+      } catch (e) {
+        parseErrors.push({ line: i + 1, error: 'invalid json' });
+      }
     }
 
-    if (rows.length === 0)
-      return res.json({ ok: true, read: 0, inserted: 0, errorsCount: 0 });
+    if (jobs.length === 0) {
+      return res.json({ ok: true, read: lines.length, inserted: 0, errorsCount: parseErrors.length, errors: parseErrors });
+    }
 
+    // insert in a single transaction
     const client = await pool.connect();
     try {
-      await client.query("BEGIN");
+      await client.query('BEGIN');
 
-      const cols = Object.keys(rows[0]);
-      const placeholders = [];
-      const values = [];
-      let p = 1;
-      for (const r of rows) {
-        const tuple = cols.map(k => `$${p++}`);
-        values.push(...cols.map(k => r[k]));
-        placeholders.push(`(${tuple.join(",")})`);
-      }
+      // ensure table exists (safe to run each import)
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS jobs (
+          company_slug    text NOT NULL,
+          internal_job_id text NOT NULL,
+          company_name    text,
+          title           text,
+          url             text,
+          location_text   text,
+          employment_type text,
+          workplace_type  text,
+          updated_at      timestamptz,
+          salary_currency text,
+          salary_min      numeric,
+          salary_max      numeric,
+          latitude        numeric,
+          longitude       numeric,
+          content_text    text,
+          extras          jsonb,
+          created_at      timestamptz DEFAULT now(),
+          PRIMARY KEY (company_slug, internal_job_id)
+        );
+      `);
 
+      // upsert rows
       const sql = `
-        INSERT INTO jobs (${cols.join(",")})
-        VALUES ${placeholders.join(",")}
-        ON CONFLICT (company_slug, internal_job_id)
-        DO UPDATE SET
-          title = EXCLUDED.title,
-          url = EXCLUDED.url,
-          updated_at = EXCLUDED.updated_at
+        INSERT INTO jobs (
+          company_slug, internal_job_id, company_name, title, url,
+          location_text, employment_type, workplace_type, updated_at,
+          salary_currency, salary_min, salary_max,
+          latitude, longitude, content_text, extras
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,
+          $6,$7,$8,$9,
+          $10,$11,$12,
+          $13,$14,$15,$16
+        )
+        ON CONFLICT (company_slug, internal_job_id) DO UPDATE SET
+          company_name    = EXCLUDED.company_name,
+          title           = EXCLUDED.title,
+          url             = EXCLUDED.url,
+          location_text   = EXCLUDED.location_text,
+          employment_type = EXCLUDED.employment_type,
+          workplace_type  = EXCLUDED.workplace_type,
+          updated_at      = EXCLUDED.updated_at,
+          salary_currency = EXCLUDED.salary_currency,
+          salary_min      = EXCLUDED.salary_min,
+          salary_max      = EXCLUDED.salary_max,
+          latitude        = EXCLUDED.latitude,
+          longitude       = EXCLUDED.longitude,
+          content_text    = EXCLUDED.content_text,
+          extras          = COALESCE(jobs.extras, '{}'::jsonb) || EXCLUDED.extras
       `;
 
-      const result = await client.query(sql, values);
-      await client.query("COMMIT");
+      let inserted = 0;
+      for (const j of jobs) {
+        // require identity
+        if (!j.company_slug || !j.internal_job_id) { continue; }
 
-      res.json({ ok: true, read: rows.length, inserted: result.rowCount });
-    } catch (e) {
-      await client.query("ROLLBACK");
-      res.status(400).json({ ok: false, error: e.message });
-    } finally {
+        await client.query(sql, [
+          j.company_slug, j.internal_job_id, j.company_name, j.title, j.url,
+          j.location_text, j.employment_type, j.workplace_type, j.updated_at,
+          j.salary_currency, j.salary_min, j.salary_max,
+          j.latitude, j.longitude, j.content_text, j.extras
+        ]);
+        inserted++;
+      }
+
+      await client.query('COMMIT');
       client.release();
+
+      return res.json({ ok: true, read: lines.length, inserted, errorsCount: parseErrors.length, errors: parseErrors });
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch {}
+      client.release();
+      return res.status(500).json({ ok: false, error: e.message });
     }
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// start server
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// tiny helpers
+function buildExtras(obj) {
+  const keep = new Set([
+    'company_slug','internal_job_id','company_name','title','url',
+    'location_text','employment_type','workplace_type','updated_at',
+    'salary_currency','salary_min','salary_max','latitude','longitude','content_text'
+  ]);
+  const extras = {};
+  for (const k of Object.keys(obj)) {
+    if (!keep.has(k)) extras[k] = obj[k];
+  }
+  return Object.keys(extras).length ? extras : null;
+}
+
+// root
+app.get('/', (_req, res) => res.json({ ok: true, service: 'jobs-backend' }));
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`jobs-backend listening on :${port}`);
+});
