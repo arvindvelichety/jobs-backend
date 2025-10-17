@@ -1,250 +1,169 @@
 // server.js
-import express from 'express';
-import dotenv from 'dotenv';
-import { Pool } from 'pg';
+import express from 'express'
+import cors from 'cors'
+import helmet from 'helmet'
+import compression from 'compression'
+import morgan from 'morgan'
+import { Pool } from 'pg'
 
-// ---------- env & config ----------
-dotenv.config();
-const PORT = process.env.PORT || 10000;
+/**
+ * ---- Config ----
+ * Set env vars in Render or a local .env:
+ * - DATABASE_URL (Postgres connection string from Neon)
+ * - PORT (optional, defaults 10000 on Render or 3000 locally)
+ * - ALLOWED_ORIGINS (comma-separated list of allowed Origins)
+ * - NODE_ENV (production/development)
+ */
+const {
+  DATABASE_URL,
+  PORT = process.env.PORT || 3000,
+  ALLOWED_ORIGINS = 'https://ergasiatech.com,https://www.ergasiatech.com,http://localhost:5173',
+  NODE_ENV = 'production'
+} = process.env
 
-// Render | Neon PG
-// Expected envs: PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD (or DATABASE_URL)
-// Also: IMPORT_TOKEN for authenticated imports
+if (!DATABASE_URL) {
+  console.error('ERROR: DATABASE_URL not set')
+  process.exit(1)
+}
+
+const allowedOrigins = ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+
+// ---- DB Pool ----
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || undefined,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
-});
+  connectionString: DATABASE_URL,
+  // Neon is fine with defaults; tune if needed:
+  max: 10,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000,
+})
 
-// Basic app (no global body parser for NDJSON route)
-const app = express();
+// ---- App ----
+const app = express()
 
-// Only enable JSON parser for normal JSON routes (not NDJSON)
-app.use(express.json({ limit: '10mb' }));
+// Security & perf
+app.use(helmet({
+  contentSecurityPolicy: false, // keep simple; tighten if needed
+}))
+app.use(compression())
+app.use(express.json({ limit: '1mb' }))
 
-// ---------- helpers ----------
-function ok(res, data = {}) {
-  return res.json({ ok: true, ...data });
-}
-function bad(res, msg, extra = {}) {
-  return res.status(400).json({ ok: false, error: msg, ...extra });
-}
-function authOr401(req, res) {
-  const importToken = req.get('x-import-token');
-  if (!process.env.IMPORT_TOKEN || importToken !== process.env.IMPORT_TOKEN) {
-    res.status(401).json({ ok: false, error: 'unauthorized' });
-    return false;
-  }
-  return true;
-}
+// Logging
+app.use(morgan(NODE_ENV === 'production' ? 'combined' : 'dev'))
 
-// Small PG ping
-async function pingDb() {
-  const { rows } = await pool.query('SELECT NOW() AS ts');
-  return rows[0].ts;
-}
+// CORS (allowlist)
+app.use(cors({
+  origin: (origin, cb) => {
+    // allow curl / same-origin requests without Origin
+    if (!origin) return cb(null, true)
+    if (allowedOrigins.includes(origin)) return cb(null, true)
+    return cb(new Error(`Not allowed by CORS: ${origin}`))
+  },
+  methods: ['GET', 'HEAD', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false,
+}))
 
-// Upsert one job (minimal required fields + payload passthrough)
-async function upsertJob(client, row) {
-  // required keys
-  const company_slug = (row.company_slug ?? '').toString().trim();
-  const internal_job_id = (row.internal_job_id ?? '').toString().trim();
-  if (!company_slug || !internal_job_id) {
-    throw new Error('missing company_slug or internal_job_id');
-  }
+// Preflight (some hosts require explicit handler)
+app.options('*', cors())
 
-  // a few commonly-used top-level columns (optional)
-  const title = row.title ?? null;
-  const url = row.url ?? null;
+// ---- Helpers ----
+const clamp = (n, min, max) => Math.max(min, Math.min(max, n))
 
-  // updated_at: allow ISO string or null; normalize to timestamp or null
-  // Postgres will cast text to timestamp when possible.
-  const updated_at = row.updated_at ?? null;
-
-  // Keep **all** original fields in payload for flexibility/search later
-  const payload = row;
-
-  // NOTE: We do NOT reference columns that might not exist in your table.
-  // If your schema has additional columns (e.g., updated_row_at), use triggers
-  // or add them explicitly.
-  await client.query(
-    `
-    INSERT INTO jobs (company_slug, internal_job_id, title, url, updated_at, payload)
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-    ON CONFLICT (company_slug, internal_job_id)
-    DO UPDATE SET
-      title      = EXCLUDED.title,
-      url        = EXCLUDED.url,
-      updated_at = EXCLUDED.updated_at,
-      payload    = EXCLUDED.payload
-    `,
-    [company_slug, internal_job_id, title, url, updated_at, JSON.stringify(payload)]
-  );
+function buildSearchWhere(search, params) {
+  if (!search) return { where: '', params }
+  // Simple ILIKE search across common columns
+  params.push(`%${search}%`)
+  const p = params.length
+  const clauses = [
+    `title ILIKE $${p}`,
+    `company_name ILIKE $${p}`,
+    `location ILIKE $${p}`,
+    `description ILIKE $${p}`,
+  ]
+  return { where: `WHERE (${clauses.join(' OR ')})`, params }
 }
 
-// ---------- routes ----------
+// ---- Routes ----
 
-// Health
-app.get('/api/health', async (_req, res) => {
+// Health / readiness
+app.get('/api/health', async (req, res) => {
   try {
-    const ts = await pingDb();
-    ok(res, { db: 'ok', ts });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+    const r = await pool.query('SELECT 1 as ok')
+    res.json({ ok: true, db: r.rows[0].ok === 1, env: NODE_ENV })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
   }
-});
+})
 
-// Count via view (preferred) or fallback to table if view is absent
-app.get('/api/jobs/count', async (_req, res) => {
-  try {
-    let q = 'SELECT COUNT(*)::int AS count FROM jobs_view';
-    try {
-      const { rows } = await pool.query(q);
-      ok(res, { count: rows[0].count });
-    } catch {
-      // fallback if the view doesn't exist
-      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM jobs');
-      ok(res, { count: rows[0].count });
-    }
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// List jobs (reads from jobs_view for nicer shape)
+// List jobs with search + pagination
+// GET /api/jobs?search=&limit=&offset=
 app.get('/api/jobs', async (req, res) => {
   try {
-    const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit, 10) || 20));
-    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const search = (req.query.search || '').toString().trim()
+    const limit = clamp(parseInt(req.query.limit || '25', 10) || 25, 1, 100)
+    const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0)
 
-    let q = `
-      SELECT *
-      FROM jobs_view
-      ORDER BY created_at DESC
-      LIMIT $1 OFFSET $2
-    `;
-    try {
-      const { rows } = await pool.query(q, [limit, offset]);
-      ok(res, { limit, offset, rows: rows.length, jobs: rows });
-    } catch {
-      // fallback: show raw jobs if view not present
-      const { rows } = await pool.query(
-        `
-        SELECT *
-        FROM jobs
-        ORDER BY created_at DESC
-        LIMIT $1 OFFSET $2
-        `,
-        [limit, offset]
-      );
-      ok(res, { limit, offset, rows: rows.length, jobs: rows });
-    }
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
+    let params = []
+    const { where, params: p2 } = buildSearchWhere(search, params)
+    params = p2
 
-// Secure NDJSON bulk upsert
-app.post('/api/jobs/ndjson', async (req, res) => {
-  try {
-    if (!authOr401(req, res)) return;
-
-    // Read raw body (don’t use express.json here)
-    let body = '';
-    await new Promise((resolve, reject) => {
-      req.setEncoding('utf8');
-      req.on('data', (chunk) => (body += chunk));
-      req.on('end', resolve);
-      req.on('error', reject);
-    });
-
-    const lines = body
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    if (lines.length === 0) {
-      return bad(res, 'no NDJSON lines found');
-    }
-
-    const batch = Math.max(1, Math.min(5000, parseInt(req.query.batch, 10) || 1000));
-
-    let read = 0;
-    let inserted = 0;
-    let errors = [];
-
-    // Process in a single transaction for atomicity
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      for (let i = 0; i < lines.length; i += batch) {
-        const chunk = lines.slice(i, i + batch);
-        for (let j = 0; j < chunk.length; j++) {
-          const n = i + j + 1;
-          read++;
-          let obj;
-          try {
-            obj = JSON.parse(chunk[j]);
-          } catch (e) {
-            errors.push({ row: n, error: 'invalid JSON', detail: e.message });
-            continue;
-          }
-          try {
-            await upsertJob(client, obj);
-            inserted++;
-          } catch (e) {
-            // extract safe summary of the offending row
-            const rowSummary = {
-              company_slug: obj?.company_slug ?? null,
-              internal_job_id: obj?.internal_job_id ?? null,
-            };
-            errors.push({ row: n, rowSummary, error: e.message });
-          }
-        }
-      }
-
-      if (errors.length > 0) {
-        // If you prefer partial success, you could COMMIT and return with errors.
-        // For now, commit regardless to keep successfully parsed rows.
-        await client.query('COMMIT');
-      } else {
-        await client.query('COMMIT');
-      }
-    } catch (txErr) {
-      await client.query('ROLLBACK');
-      throw txErr;
-    } finally {
-      client.release();
-    }
+    const sql = `
+      SELECT id, company_name, title, location, description, url, created_at
+      FROM jobs
+      ${where}
+      ORDER BY created_at DESC NULLS LAST, id DESC
+      LIMIT $${params.push(limit)}
+      OFFSET $${params.push(offset)}
+    `
+    const { rows } = await pool.query(sql, params)
 
     res.json({
       ok: true,
-      read,
-      inserted,
-      errorsCount: errors.length,
-      ...(errors.length ? { errors } : {}),
-    });
-  } catch (err) {
-    console.error('POST /api/jobs/ndjson failed:', err);
-    res.status(500).json({ ok: false, error: err.message });
+      limit,
+      offset,
+      count: rows.length,
+      jobs: rows,
+    })
+  } catch (e) {
+    console.error('GET /api/jobs error:', e)
+    res.status(500).json({ ok: false, error: e.message })
   }
-});
+})
 
-// Simple root page (helps Render health)
-app.get('/', (_req, res) => {
-  res.type('text/plain').send('ok');
-});
-
-// ---------- start ----------
-app.listen(PORT, () => {
-  console.log(`Server listening on :${PORT}`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
+// Get one job
+// GET /api/jobs/:id
+app.get('/api/jobs/:id', async (req, res) => {
   try {
-    await pool.end();
-  } finally {
-    process.exit(0);
+    const { id } = req.params
+    const { rows } = await pool.query(
+      `SELECT id, company_name, title, location, description, url, created_at
+       FROM jobs
+       WHERE id = $1
+       LIMIT 1`,
+      [id]
+    )
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Not found' })
+    res.json({ ok: true, job: rows[0] })
+  } catch (e) {
+    console.error('GET /api/jobs/:id error:', e)
+    res.status(500).json({ ok: false, error: e.message })
   }
-});
+})
+
+// Fallback 404 (API only; do not serve files from here)
+app.use('/api', (req, res) => {
+  res.status(404).json({ ok: false, error: 'Not found' })
+})
+
+// Global error handler
+// (Express will pass errors here if next(err) used)
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err)
+  res.status(500).json({ ok: false, error: err.message || 'Server error' })
+})
+
+// ---- Start ----
+app.listen(PORT, () => {
+  console.log(`API listening on port ${PORT} in ${NODE_ENV} mode`)
+  console.log(`Allowed origins: ${allowedOrigins.join(', ')}`)
+})
